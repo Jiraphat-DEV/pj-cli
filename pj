@@ -475,12 +475,22 @@ cmd_sync() {
             return
         fi
 
-        # Pull latest
+        # Pull latest (fallback to explicit origin/<branch> if no upstream)
         local pull_out
         pull_out=$(git -C "$rdir" pull --ff-only 2>&1)
         if [[ $? -ne 0 ]]; then
-            echo "PULL_FAIL:$pull_out" > "$outfile"
-            return
+            # Retry with explicit remote/branch if no upstream tracking
+            if [[ "$pull_out" == *"no tracking information"* ]] || [[ "$pull_out" == *"There is no tracking"* ]]; then
+                git -C "$rdir" branch --set-upstream-to="origin/$default_branch" "$default_branch" 2>/dev/null
+                pull_out=$(git -C "$rdir" pull --ff-only 2>&1)
+                if [[ $? -ne 0 ]]; then
+                    echo "PULL_FAIL:$pull_out" > "$outfile"
+                    return
+                fi
+            else
+                echo "PULL_FAIL:$pull_out" > "$outfile"
+                return
+            fi
         fi
 
         echo "OK:$default_branch:$pull_out" > "$outfile"
