@@ -463,10 +463,6 @@ cmd_sync() {
             return
         fi
 
-        # Fetch first
-        local fetch_out
-        fetch_out=$(git -C "$rdir" fetch origin 2>&1)
-
         # Checkout default branch
         local checkout_out
         checkout_out=$(git -C "$rdir" checkout "$default_branch" 2>&1)
@@ -499,14 +495,23 @@ cmd_sync() {
     local name="" result="" branch="" detail=""
 
     if $parallel; then
-        # Parallel execution
+        # Parallel execution with concurrency limit
+        local max_jobs=4
+        local running=0
         local -a pids=()
         local pid=""
         for idx in "${indices[@]}"; do
             sync_one_repo "$idx" &
             pids+=($!)
+            ((running++))
+            if [[ $running -ge $max_jobs ]]; then
+                # Wait for any one job to finish before starting the next
+                wait "${pids[1]}" 2>/dev/null
+                pids=("${pids[@]:1}")
+                ((running--))
+            fi
         done
-        # Wait for all
+        # Wait for remaining jobs
         for pid in "${pids[@]}"; do
             wait "$pid" 2>/dev/null
         done
@@ -587,8 +592,24 @@ cmd_sync() {
                     printf "${C_RED}MISSING${C_RESET} ${C_DIM}(directory not found)${C_RESET}\n"
                     failed_repos+=("$name")
                     ;;
+                NOT_GIT)
+                    printf "${C_RED}ERROR${C_RESET} ${C_DIM}(not a git repo)${C_RESET}\n"
+                    failed_repos+=("$name")
+                    ;;
+                NO_DEFAULT)
+                    printf "${C_RED}ERROR${C_RESET} ${C_DIM}(cannot detect default branch)${C_RESET}\n"
+                    failed_repos+=("$name")
+                    ;;
+                CHECKOUT_FAIL:*)
+                    printf "${C_RED}FAILED${C_RESET} ${C_DIM}(checkout: ${result#CHECKOUT_FAIL:})${C_RESET}\n"
+                    failed_repos+=("$name")
+                    ;;
+                PULL_FAIL:*)
+                    printf "${C_RED}FAILED${C_RESET} ${C_DIM}(pull: ${result#PULL_FAIL:})${C_RESET}\n"
+                    failed_repos+=("$name")
+                    ;;
                 *)
-                    printf "${C_RED}FAILED${C_RESET}\n"
+                    printf "${C_RED}FAILED${C_RESET} ${C_DIM}(${result:-no output})${C_RESET}\n"
                     failed_repos+=("$name")
                     ;;
             esac
