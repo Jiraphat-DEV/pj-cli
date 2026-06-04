@@ -447,9 +447,11 @@ cmd_sync() {
             return
         fi
 
-        # Check for uncommitted changes
+        # Check for uncommitted changes to tracked files only.
+        # Untracked files don't block checkout/pull; if they ever conflict,
+        # git fails on its own and CHECKOUT_FAIL/PULL_FAIL handles it.
         local status_output
-        status_output=$(git -C "$rdir" status --porcelain 2>&1)
+        status_output=$(git -C "$rdir" status --porcelain --untracked-files=no 2>&1)
         if [[ -n "$status_output" ]]; then
             echo "DIRTY" > "$outfile"
             return
