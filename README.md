@@ -8,6 +8,7 @@ A lightweight CLI tool for developers and tech leads who manage multiple git rep
 - **`pj status`** -- Color-coded dashboard showing branch, dirty/clean, ahead/behind for every repo
 - **`pj branches`** -- View all branches across all repos at once
 - **`pj cleanup`** -- Delete merged branches across repos (with confirmation)
+- **`pj deps`** -- Dependabot status and open vulnerability alerts per repo (needs `gh`)
 - **Group filtering** -- Organize repos into groups and operate on specific groups
 - **Parallel mode** -- Speed up sync with `--parallel` flag
 - **Zero dependencies** -- Pure Zsh script, works on macOS out of the box
@@ -130,6 +131,22 @@ pj add ~/projects/new-repo backend    # Add a repo to a group
 pj remove old-repo                    # Remove by name
 ```
 
+### Dependency alerts
+
+Show, for every repo with a GitHub remote, whether Dependabot alerts and
+automatic security PRs are switched on, plus the open alert count by severity
+and how many Dependabot PRs are waiting:
+
+```bash
+pj deps                  # All repos
+pj deps fitsloth-crm     # Only the "fitsloth-crm" group
+```
+
+`ALERTS = OFF` means Dependabot alerts are disabled for that repo, `-` means the
+repo has no GitHub remote. Results are cached for 10 minutes. A repo showing 0
+alerts while using `bun.lock` is not necessarily clean, since Dependabot cannot
+read that lockfile. Requires the `gh` CLI, logged in.
+
 ## Configuration
 
 The config file is at `~/.pjconfig` (or set `PJ_CONFIG` env var). Format:
@@ -160,6 +177,7 @@ The config file is at `~/.pjconfig` (or set `PJ_CONFIG` env var). Format:
 
 - **macOS** or **Linux** with Zsh installed
 - Git
+- [`gh`](https://cli.github.com) (only for `pj deps`)
 
 ## How it works
 

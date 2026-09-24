@@ -132,6 +132,7 @@ ${C_BOLD}COMMANDS${C_RESET}
     ${C_CYAN}status${C_RESET} [group]          Dashboard of all repos (branch, status, ahead/behind)
     ${C_CYAN}branches${C_RESET} [repo]         Show branches across repos
     ${C_CYAN}cleanup${C_RESET} [group]         Delete merged branches (with confirmation)
+    ${C_CYAN}deps${C_RESET} [group|repo]      Dependabot status & open alerts per repo (needs gh)
     ${C_CYAN}list${C_RESET} [--paths|--groups] List managed repos and groups
     ${C_CYAN}add${C_RESET} <path> [group]      Add a repo to config
     ${C_CYAN}remove${C_RESET} <path|name>      Remove a repo from config
@@ -153,6 +154,8 @@ ${C_BOLD}EXAMPLES${C_RESET}
     pj status                 Show status dashboard
     pj branches fitsloth-crm  Show branches for CRM repos
     pj cleanup --dry-run      Preview merged branches to delete
+    pj deps                   Dependabot alerts across all repos
+    pj deps fitsloth-webapp   Dependabot alerts for the WebApp group
 EOF
 }
 
@@ -939,6 +942,114 @@ cmd_cleanup() {
     echo ""
 }
 
+# ── pj deps ───────────────────────────────────────────────────────────────────
+
+cmd_deps() {
+    local filter=""
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -*) echo "${C_RED}Unknown option: $1${C_RESET}" ; return 1 ;;
+            *) filter="$1" ;;
+        esac
+        shift
+    done
+
+    if ! command -v gh >/dev/null 2>&1; then
+        echo "${C_RED}gh CLI not found. Install with: brew install gh${C_RESET}"
+        return 1
+    fi
+    if ! gh auth status >/dev/null 2>&1; then
+        echo "${C_RED}gh is not logged in. Run: gh auth login${C_RESET}"
+        return 1
+    fi
+
+    load_config || return 1
+
+    local rdir="" name="" group="" slug="" sev="" fixes="" prs="" crit_c=""
+    local crit=0 high=0 med=0 low=0
+    local t_crit=0 t_high=0 t_med=0 t_low=0 t_prs=0
+
+    echo ""
+    printf "${C_BOLD_WHITE}%-32s %-6s %-6s %5s %5s %5s %5s %5s${C_RESET}\n" \
+        "REPO" "ALERTS" "AUTOPR" "CRIT" "HIGH" "MED" "LOW" "PRS"
+    print_separator
+
+    for i in {1..${#REPO_PATHS[@]}}; do
+        rdir="${REPO_PATHS[$i]}"
+        name="${REPO_NAMES[$i]}"
+        group="${REPO_GROUPS[$i]}"
+
+        if [[ -n "$filter" ]]; then
+            if [[ "$name" != *"$filter"* ]] && [[ "$group" != "$filter" ]]; then
+                continue
+            fi
+        fi
+
+        # owner/repo from the origin remote; skip repos that have none
+        slug="$(git -C "$rdir" remote get-url origin 2>/dev/null \
+            | sed -E 's#^git@[^:]+:##; s#^https?://[^/]+/##; s#\.git$##')"
+        if [[ "$slug" != */* ]]; then
+            printf "${C_DIM}%-32s %-6s %-6s %5s %5s %5s %5s %5s${C_RESET}\n" \
+                "${name:0:32}" "-" "-" "-" "-" "-" "-" "-"
+            continue
+        fi
+
+        # The origin remote may still carry an old repo name. The REST API
+        # follows the rename, gh pr list (GraphQL) does not, so resolve it once.
+        local canon=""
+        canon="$(gh api --cache 60m "repos/$slug" --jq '.full_name' 2>/dev/null)"
+        if [[ -z "$canon" ]]; then
+            printf "${C_DIM}%-32s %-6s %-6s %5s %5s %5s %5s %5s${C_RESET}\n" \
+                "${name:0:32}" "n/a" "-" "-" "-" "-" "-" "-"
+            continue
+        fi
+        slug="$canon"
+
+        # A 403 here means Dependabot alerts are switched off for the repo
+        if ! sev="$(gh api --paginate --cache 10m \
+                "repos/$slug/dependabot/alerts?state=open&per_page=100" \
+                --jq '.[].security_advisory.severity' 2>/dev/null)"; then
+            printf "%-32s ${C_RED}%-6s${C_RESET} %-6s %5s %5s %5s %5s %5s\n" \
+                "${name:0:32}" "OFF" "-" "-" "-" "-" "-" "-"
+            continue
+        fi
+
+        crit=$(print -r -- "$sev" | grep -c '^critical$')
+        high=$(print -r -- "$sev" | grep -c '^high$')
+        med=$(print -r -- "$sev" | grep -c '^medium$')
+        low=$(print -r -- "$sev" | grep -c '^low$')
+
+        fixes="$(gh api --cache 10m "repos/$slug/automated-security-fixes" \
+            --jq 'if .enabled then "on" else "off" end' 2>/dev/null)"
+        [[ -z "$fixes" ]] && fixes="?"
+
+        prs="$(gh pr list -R "$slug" --author app/dependabot --state open \
+            --json number --jq 'length' 2>/dev/null)"
+        [[ -z "$prs" ]] && prs=0
+
+        if [[ $crit -gt 0 ]]; then
+            crit_c="${C_BOLD_RED}"
+        else
+            crit_c="${C_DIM}"
+        fi
+
+        printf "%-32s ${C_GREEN}%-6s${C_RESET} %-6s ${crit_c}%5s${C_RESET} %5s %5s %5s %5s\n" \
+            "${name:0:32}" "on" "$fixes" "$crit" "$high" "$med" "$low" "$prs"
+
+        (( t_crit += crit )) ; (( t_high += high ))
+        (( t_med += med )) ; (( t_low += low )) ; (( t_prs += prs ))
+    done
+
+    print_separator
+    printf "${C_BOLD}%-32s %-6s %-6s %5s %5s %5s %5s %5s${C_RESET}\n" \
+        "TOTAL" "" "" "$t_crit" "$t_high" "$t_med" "$t_low" "$t_prs"
+    echo ""
+    echo "${C_DIM}Alert data is cached for 10m. A repo with 0 alerts but a bun.lock"
+    echo "is not necessarily clean: Dependabot cannot read bun.lock.${C_RESET}"
+    echo ""
+}
+
 # ── Main Dispatch ─────────────────────────────────────────────────────────────
 
 main() {
@@ -950,6 +1061,7 @@ main() {
         status|st) cmd_status "$@" ;;
         branches|br) cmd_branches "$@" ;;
         cleanup)  cmd_cleanup "$@" ;;
+        deps|dependabot) cmd_deps "$@" ;;
         list|ls)  cmd_list "$@" ;;
         add)      cmd_add "$@" ;;
         remove|rm) cmd_remove "$@" ;;
