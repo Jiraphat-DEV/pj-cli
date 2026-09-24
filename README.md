@@ -9,6 +9,8 @@ A lightweight CLI tool for developers and tech leads who manage multiple git rep
 - **`pj branches`** -- View all branches across all repos at once
 - **`pj cleanup`** -- Delete merged branches across repos (with confirmation)
 - **`pj deps`** -- Dependabot status and open vulnerability alerts per repo (needs `gh`)
+- **`pj prs`** -- Open PRs per repo: which have no review from anyone else, which went stale (needs `gh`)
+- **`pj deploys`** -- Last deploy per repo: when, from which branch, by whom (needs `gh`)
 - **Group filtering** -- Organize repos into groups and operate on specific groups
 - **Parallel mode** -- Speed up sync with `--parallel` flag
 - **Zero dependencies** -- Pure Zsh script, works on macOS out of the box
@@ -146,6 +148,31 @@ pj deps fitsloth-crm     # Only the "fitsloth-crm" group
 repo has no GitHub remote. Results are cached for 10 minutes. A repo showing 0
 alerts while using `bun.lock` is not necessarily clean, since Dependabot cannot
 read that lockfile. Requires the `gh` CLI, logged in.
+
+### Open pull requests
+
+```bash
+pj prs                   # All repos
+pj prs fitsloth-crm      # Only one group
+pj prs --stale 14        # Count a PR as stale after 14 days instead of 7
+```
+
+`NO-APPROVE` counts PRs with no APPROVED review from someone other than the
+author, so a self-approved PR still shows up. Repos with no open PR are left
+out. Below the table, every non-draft PR that has no outside approval or has
+gone stale is listed with its number, age and author.
+
+### Deploy history
+
+```bash
+pj deploys               # Last prod deploy per repo
+pj deploys --env uat     # Same for UAT
+pj deploys --days 7      # Count deploys in the last 7 days instead of 30
+```
+
+Reads the GitHub Deployments API, so it reflects what actually ran, not what
+was merged. `REF` is the branch the deploy ran from, which is worth watching
+when production is supposed to ship only from the default branch.
 
 ## Configuration
 

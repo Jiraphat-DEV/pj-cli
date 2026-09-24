@@ -133,6 +133,8 @@ ${C_BOLD}COMMANDS${C_RESET}
     ${C_CYAN}branches${C_RESET} [repo]         Show branches across repos
     ${C_CYAN}cleanup${C_RESET} [group]         Delete merged branches (with confirmation)
     ${C_CYAN}deps${C_RESET} [group|repo]      Dependabot status & open alerts per repo (needs gh)
+    ${C_CYAN}prs${C_RESET} [group|repo]       Open PRs, which lack review and which went stale (needs gh)
+    ${C_CYAN}deploys${C_RESET} [group|repo]   Last deploy per repo: when, from which branch, by whom (needs gh)
     ${C_CYAN}list${C_RESET} [--paths|--groups] List managed repos and groups
     ${C_CYAN}add${C_RESET} <path> [group]      Add a repo to config
     ${C_CYAN}remove${C_RESET} <path|name>      Remove a repo from config
@@ -156,6 +158,8 @@ ${C_BOLD}EXAMPLES${C_RESET}
     pj cleanup --dry-run      Preview merged branches to delete
     pj deps                   Dependabot alerts across all repos
     pj deps fitsloth-webapp   Dependabot alerts for the WebApp group
+    pj prs                    Open PRs waiting for review
+    pj deploys --env uat      Last UAT deploy per repo
 EOF
 }
 
@@ -942,6 +946,38 @@ cmd_cleanup() {
     echo ""
 }
 
+# ── GitHub helpers (shared by deps / prs / deploys) ───────────────────────────
+
+pj_require_gh() {
+    if ! command -v gh >/dev/null 2>&1; then
+        echo "${C_RED}gh CLI not found. Install with: brew install gh${C_RESET}"
+        return 1
+    fi
+    if ! gh auth status >/dev/null 2>&1; then
+        echo "${C_RED}gh is not logged in. Run: gh auth login${C_RESET}"
+        return 1
+    fi
+    return 0
+}
+
+# Canonical owner/repo for a local checkout, empty when it has no GitHub remote.
+# The origin remote may still carry an old name: the REST API follows repo
+# renames, gh pr list (GraphQL) does not, so resolve it once here.
+pj_repo_slug() {
+    local dir="$1" slug="" canon=""
+    slug="$(git -C "$dir" remote get-url origin 2>/dev/null \
+        | sed -E 's#^git@[^:]+:##; s#^https?://[^/]+/##; s#\.git$##')"
+    [[ "$slug" != */* ]] && return 1
+    canon="$(gh api --cache 60m "repos/$slug" --jq '.full_name' 2>/dev/null)"
+    [[ -z "$canon" ]] && return 1
+    print -r -- "$canon"
+}
+
+# YYYY-MM-DD for N days ago, BSD date first then GNU date.
+pj_days_ago() {
+    date -u -v-"$1"d +%Y-%m-%d 2>/dev/null || date -u -d "$1 days ago" +%Y-%m-%d
+}
+
 # ── pj deps ───────────────────────────────────────────────────────────────────
 
 cmd_deps() {
@@ -955,15 +991,7 @@ cmd_deps() {
         shift
     done
 
-    if ! command -v gh >/dev/null 2>&1; then
-        echo "${C_RED}gh CLI not found. Install with: brew install gh${C_RESET}"
-        return 1
-    fi
-    if ! gh auth status >/dev/null 2>&1; then
-        echo "${C_RED}gh is not logged in. Run: gh auth login${C_RESET}"
-        return 1
-    fi
-
+    pj_require_gh || return 1
     load_config || return 1
 
     local rdir="" name="" group="" slug="" sev="" fixes="" prs="" crit_c=""
@@ -986,25 +1014,11 @@ cmd_deps() {
             fi
         fi
 
-        # owner/repo from the origin remote; skip repos that have none
-        slug="$(git -C "$rdir" remote get-url origin 2>/dev/null \
-            | sed -E 's#^git@[^:]+:##; s#^https?://[^/]+/##; s#\.git$##')"
-        if [[ "$slug" != */* ]]; then
+        if ! slug="$(pj_repo_slug "$rdir")"; then
             printf "${C_DIM}%-32s %-6s %-6s %5s %5s %5s %5s %5s${C_RESET}\n" \
                 "${name:0:32}" "-" "-" "-" "-" "-" "-" "-"
             continue
         fi
-
-        # The origin remote may still carry an old repo name. The REST API
-        # follows the rename, gh pr list (GraphQL) does not, so resolve it once.
-        local canon=""
-        canon="$(gh api --cache 60m "repos/$slug" --jq '.full_name' 2>/dev/null)"
-        if [[ -z "$canon" ]]; then
-            printf "${C_DIM}%-32s %-6s %-6s %5s %5s %5s %5s %5s${C_RESET}\n" \
-                "${name:0:32}" "n/a" "-" "-" "-" "-" "-" "-"
-            continue
-        fi
-        slug="$canon"
 
         # A 403 here means Dependabot alerts are switched off for the repo
         if ! sev="$(gh api --paginate --cache 10m \
@@ -1050,6 +1064,190 @@ cmd_deps() {
     echo ""
 }
 
+# ── pj prs ────────────────────────────────────────────────────────────────────
+
+cmd_prs() {
+    local filter="" stale_days=7
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --stale) shift ; stale_days="$1" ;;
+            -*) echo "${C_RED}Unknown option: $1${C_RESET}" ; return 1 ;;
+            *) filter="$1" ;;
+        esac
+        shift
+    done
+
+    pj_require_gh || return 1
+    load_config || return 1
+
+    local cutoff="$(pj_days_ago "$stale_days")"
+    local rdir="" name="" group="" slug="" rows="" line=""
+    local num="" created="" author="" draft="" approvers="" title=""
+    local open_n=0 noappr_n=0 stale_n=0 draft_n=0
+    local t_open=0 t_noappr=0 t_stale=0
+    local -a attention=()
+
+    echo ""
+    printf "${C_BOLD_WHITE}%-32s %6s %10s %8s %7s${C_RESET}\n" \
+        "REPO" "OPEN" "NO-APPROVE" "STALE" "DRAFT"
+    print_separator
+
+    for i in {1..${#REPO_PATHS[@]}}; do
+        rdir="${REPO_PATHS[$i]}" ; name="${REPO_NAMES[$i]}" ; group="${REPO_GROUPS[$i]}"
+
+        if [[ -n "$filter" ]]; then
+            if [[ "$name" != *"$filter"* ]] && [[ "$group" != "$filter" ]]; then
+                continue
+            fi
+        fi
+
+        slug="$(pj_repo_slug "$rdir")" || continue
+        [[ -z "$slug" ]] && continue
+
+        rows="$(gh pr list -R "$slug" --state open --limit 100 \
+            --json number,createdAt,author,isDraft,latestReviews,title \
+            --jq '.[] | [.number, .createdAt, .author.login, (.isDraft|tostring),
+                  ([.latestReviews[] | select(.state == "APPROVED") | .author.login]
+                    | join(",") | if . == "" then "-" else . end),
+                  .title] | @tsv' 2>/dev/null)"
+
+        open_n=0 ; noappr_n=0 ; stale_n=0 ; draft_n=0
+        while IFS=$'\t' read -r num created author draft approvers title; do
+            [[ -z "$num" ]] && continue
+            (( open_n++ ))
+            [[ "$draft" == "true" ]] && (( draft_n++ ))
+
+            # Approved only counts when the approver is not the PR author
+            local approved_by_other=false
+            local a=""
+            # "-" means nobody approved; tab-separated empty fields collapse,
+            # so the jq above substitutes a placeholder instead.
+            for a in ${(s:,:)approvers}; do
+                [[ -n "$a" && "$a" != "-" && "$a" != "$author" ]] && approved_by_other=true
+            done
+
+            local is_stale=false
+            [[ "${created%%T*}" < "$cutoff" ]] && is_stale=true
+
+            [[ "$approved_by_other" == false ]] && (( noappr_n++ ))
+            [[ "$is_stale" == true ]] && (( stale_n++ ))
+
+            if [[ "$draft" != "true" ]] && \
+               { [[ "$approved_by_other" == false ]] || [[ "$is_stale" == true ]] ; }; then
+                attention+=("$(printf "%-28s #%-5s %-11s %-16s %s" \
+                    "${name:0:28}" "$num" "${created%%T*}" "${author:0:16}" "${title:0:44}")")
+            fi
+        done <<< "$rows"
+
+        (( open_n == 0 )) && continue
+
+        printf "%-32s %6s " "${name:0:32}" "$open_n"
+        if (( noappr_n > 0 )); then
+            printf "${C_YELLOW}%10s${C_RESET} " "$noappr_n"
+        else
+            printf "%10s " "$noappr_n"
+        fi
+        if (( stale_n > 0 )); then
+            printf "${C_RED}%8s${C_RESET} %7s\n" "$stale_n" "$draft_n"
+        else
+            printf "%8s %7s\n" "$stale_n" "$draft_n"
+        fi
+
+        (( t_open += open_n )) ; (( t_noappr += noappr_n )) ; (( t_stale += stale_n ))
+    done
+
+    print_separator
+    printf "${C_BOLD}%-32s %6s %10s %8s${C_RESET}\n" "TOTAL" "$t_open" "$t_noappr" "$t_stale"
+
+    if (( ${#attention[@]} > 0 )); then
+        echo ""
+        echo "${C_BOLD}NEEDS ATTENTION${C_RESET} ${C_DIM}(no approval from another person, or older than ${stale_days} days)${C_RESET}"
+        print_separator
+        local row=""
+        for row in "${attention[@]}"; do
+            echo "$row"
+        done
+    fi
+    echo ""
+}
+
+# ── pj deploys ────────────────────────────────────────────────────────────────
+
+cmd_deploys() {
+    local filter="" env="prod" days=30
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --env) shift ; env="$1" ;;
+            --days) shift ; days="$1" ;;
+            -*) echo "${C_RED}Unknown option: $1${C_RESET}" ; return 1 ;;
+            *) filter="$1" ;;
+        esac
+        shift
+    done
+
+    pj_require_gh || return 1
+    load_config || return 1
+
+    local cutoff="$(pj_days_ago "$days")"
+    local rdir="" name="" group="" slug="" latest="" dates="" recent=0
+    local dep_id="" dep_ref="" dep_by="" dep_at="" state=""
+
+    echo ""
+    printf "${C_BOLD_WHITE}%-32s %-11s %-22s %-16s %-9s %5s${C_RESET}\n" \
+        "REPO" "LAST" "REF" "BY" "STATE" "${days}d"
+    print_separator
+
+    for i in {1..${#REPO_PATHS[@]}}; do
+        rdir="${REPO_PATHS[$i]}" ; name="${REPO_NAMES[$i]}" ; group="${REPO_GROUPS[$i]}"
+
+        if [[ -n "$filter" ]]; then
+            if [[ "$name" != *"$filter"* ]] && [[ "$group" != "$filter" ]]; then
+                continue
+            fi
+        fi
+
+        slug="$(pj_repo_slug "$rdir")" || continue
+        [[ -z "$slug" ]] && continue
+
+        latest="$(gh api --cache 10m \
+            "repos/$slug/deployments?environment=$env&per_page=100" \
+            --jq '.[0] | [(.id|tostring), .ref, .creator.login, .created_at] | @tsv' 2>/dev/null)"
+        [[ -z "$latest" || "$latest" == "null"* ]] && continue
+
+        IFS=$'\t' read -r dep_id dep_ref dep_by dep_at <<< "$latest"
+
+        dates="$(gh api --cache 10m \
+            "repos/$slug/deployments?environment=$env&per_page=100" \
+            --jq '.[].created_at' 2>/dev/null)"
+        recent=0
+        local d=""
+        while IFS= read -r d; do
+            [[ -z "$d" ]] && continue
+            [[ "${d%%T*}" > "$cutoff" ]] && (( recent++ ))
+        done <<< "$dates"
+
+        state="$(gh api --cache 10m "repos/$slug/deployments/$dep_id/statuses?per_page=1" \
+            --jq '.[0].state' 2>/dev/null)"
+        [[ -z "$state" || "$state" == "null" ]] && state="?"
+
+        printf "%-32s %-11s %-22s %-16s " \
+            "${name:0:32}" "${dep_at%%T*}" "${dep_ref:0:22}" "${dep_by:0:16}"
+        case "$state" in
+            success)  printf "${C_GREEN}%-9s${C_RESET}" "$state" ;;
+            failure|error) printf "${C_RED}%-9s${C_RESET}" "$state" ;;
+            *)        printf "${C_YELLOW}%-9s${C_RESET}" "$state" ;;
+        esac
+        printf " %5s\n" "$recent"
+    done
+
+    print_separator
+    echo "${C_DIM}Environment: ${env}. REF is the branch the deploy ran from."
+    echo "A repo with no deployment to this environment is omitted.${C_RESET}"
+    echo ""
+}
+
 # ── Main Dispatch ─────────────────────────────────────────────────────────────
 
 main() {
@@ -1062,6 +1260,8 @@ main() {
         branches|br) cmd_branches "$@" ;;
         cleanup)  cmd_cleanup "$@" ;;
         deps|dependabot) cmd_deps "$@" ;;
+        prs|pr)   cmd_prs "$@" ;;
+        deploys|deploy) cmd_deploys "$@" ;;
         list|ls)  cmd_list "$@" ;;
         add)      cmd_add "$@" ;;
         remove|rm) cmd_remove "$@" ;;
