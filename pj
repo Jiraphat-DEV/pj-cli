@@ -435,7 +435,9 @@ cmd_sync() {
 
     local -a ok_repos skipped_repos failed_repos
     local tmpdir="$(mktemp -d)"
-    trap "rm -rf '$tmpdir'" EXIT INT TERM
+    trap "rm -rf '$tmpdir'" EXIT
+    # Ctrl-C must abort, otherwise the loop keeps running against a deleted tmpdir
+    trap "rm -rf '$tmpdir'; exit 130" INT TERM
 
     sync_one_repo() {
         local idx=$1
